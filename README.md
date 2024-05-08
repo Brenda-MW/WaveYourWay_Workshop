@@ -1,3 +1,4 @@
+[![Open in MATLAB Online](https://www.mathworks.com/images/responsive/global/open-in-matlab-online.svg)](https://workshop-matlab.mathworks.com/open/github/v1?repo=Brenda-MW/WaveYourWay_Workshop)
 # Wave Your Way: Deploy Personalized Gesture Recognition using ToF Sensors with MATLAB and STM32Cube.AI Dev Cloud
 
 Just as speech and handwriting bear the unique signature of an individual, human gestures carry a distinct personal touch. Crafting a one-size-fits-all classifier for gesture recognition poses significant challenges due to the inherent variability among individuals. Accurately recognizing gestures in different scenarios, such as driving and gaming, under variable carry position of a tiny device, remains challenging due to limited and costly data availability.
