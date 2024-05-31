@@ -7,13 +7,16 @@ classdef ConverterForQuantizedWeightsBiasEntity < nnet.internal.cnn.onnx.NNTLaye
         CheckEntity {mustBeMember(CheckEntity, {'Weights', 'Bias'})} = 'Weights'
         ExponentValue  (1,1) {mustBeNumeric}
         EntityDatatype {mustBeText} = ''
+        IsFullyConnectedLayer {mustBeNumericOrLogical}
     end
 
     methods
         function this = ConverterForQuantizedWeightsBiasEntity(layerAnalyzer,...
                 checkEntity, exponentValue, entityDatatype, opsetVersion)
             this@nnet.internal.cnn.onnx.NNTLayerConverter(layerAnalyzer);
-            this.OpsetVersion   = opsetVersion;
+            this.IsRecurrentNetwork    = layerAnalyzer.IsRNNLayer; % may require in future
+            this.IsFullyConnectedLayer = layerAnalyzer.IsFullyConnectedLayer;
+            this.OpsetVersion   = opsetVersion;  % may require in future to update the opset
             this.CheckEntity    = checkEntity;
             this.ExponentValue  = exponentValue;
             this.EntityDatatype = entityDatatype;
@@ -28,20 +31,31 @@ classdef ConverterForQuantizedWeightsBiasEntity < nnet.internal.cnn.onnx.NNTLaye
             if ~isempty(this.EntityDatatype)
                 % extract the required tensor where quantized
                 % weights/bias is stored.
-                [qtensor, parameterInitializers] = extractTensorProtobyOnnxName(this, parameterInitializers, inputLayerName);
+                [qtensor, parameterInitializers] = extractTensorProtobyOnnxName(this,...
+                    parameterInitializers, inputLayerName);
                 % create the dequantize-linear node for weights/bias
                 % containing quantized values.
-                [dQLinearNodeProto, paramInitializer, qTensorNameMap] = createDqLinearOnnxNode(this, nodeProtos, inputLayerName,...
-                    qTensorNameMap, qtensor);
+                [dQLinearNodeProto, paramInitializer, qTensorNameMap] = createDqLinearOnnxNode(this,...
+                    nodeProtos, inputLayerName, qTensorNameMap, qtensor);
                 % append nodeprotos and tensorprotos.
-                nodeProtos            = [nodeProtos, dQLinearNodeProto];
+                allNodeProtosNames    = {nodeProtos.name};
+                % to add nodes in topological order
+                if this.IsFullyConnectedLayer && strcmpi(this.CheckEntity, 'Weights')
+                    inputLayerMatMulName = strrep(inputLayerName, '_Add', '_MatMul');
+                    layerNodeProtoIdx    = find(strcmpi(inputLayerMatMulName, allNodeProtosNames));
+                else
+                    layerNodeProtoIdx    = find(strcmpi(inputLayerName, allNodeProtosNames));
+                end
+                nodeProtos            = [nodeProtos(1:layerNodeProtoIdx-1), dQLinearNodeProto,...
+                    nodeProtos(layerNodeProtoIdx:end)];
                 parameterInitializers = [parameterInitializers, paramInitializer];
             end
         end
     end
 
     methods(Access=protected)
-        function [dQLinearNodeProto, parameterInitializer, qTensorNameMap] = createDqLinearOnnxNode(this, nodeProtos, inputLayerName, qTensorNameMap, qTensor)
+        function [dQLinearNodeProto, parameterInitializer, qTensorNameMap] = createDqLinearOnnxNode(this,...
+                nodeProtos, inputLayerName, qTensorNameMap, qTensor)
             import nnet.internal.cnn.onnx.*
             % Make the nodeProto for Weights, Scale and Zero-point for
             % DequantizeLinear Weights/bias node
@@ -77,7 +91,7 @@ classdef ConverterForQuantizedWeightsBiasEntity < nnet.internal.cnn.onnx.NNTLaye
             t2.name      = paramScaleName;
             t2.data_type = TensorProto_DataType.FLOAT;
             t2.raw_data  = rawData(2^(single(this.ExponentValue)));
-            t2.dims      = qTensor.dims(1); %[]; % scalar
+            t2.dims      = []; % scalar
 
             % Make parameter Initializers for Zero Point
             t3             = TensorProto;
@@ -85,26 +99,20 @@ classdef ConverterForQuantizedWeightsBiasEntity < nnet.internal.cnn.onnx.NNTLaye
             t3.data_type   = TensorProto_DataType.(sprintf(upper(this.EntityDatatype)));
             zeroPointValue = cast(0, class(parsedData));
             t3.raw_data    = rawData(zeroPointValue);
-            t3.dims        = qTensor.dims(1); %[]; % scalar
+            t3.dims        = []; % scalar
 
+            % append tensorprotos
             parameterInitializer = [t1, t2, t3];
-
-            if isa(this.NNTLayer, 'nnet.cnn.layer.FullyConnectedLayer')
-                inputLayerNameCopy = inputLayerName;
-                inputLayerName     = strrep(inputLayerName, '_Add', '');
-            end
-
+            % obtain the nodeproto index using nodeproto layername to
+            % access the nodeproto inputs
             nodeProtoIdx  = matches({nodeProtos.name}, inputLayerName);
-            if ~any(nodeProtoIdx)
-                switch this.CheckEntity(1)
-                    case 'W'
-                        inputLayerName = strrep(inputLayerNameCopy, '_Add', '_MatMul');
-                        nodeProtoIdx   = matches({nodeProtos.name}, inputLayerName);
-                    case 'B'
-                        nodeProtoIdx   = matches({nodeProtos.name}, inputLayerNameCopy);
-                        inputLayerName = inputLayerNameCopy;
-                end
+            % For Fully connected layer, nodeproto layername is appended
+            % with _MatMul for Weights entity
+            if this.IsFullyConnectedLayer && strcmpi(this.CheckEntity(1), 'W')
+                inputLayerName = strrep(inputLayerName, '_Add', '_MatMul');
+                nodeProtoIdx   = matches({nodeProtos.name}, inputLayerName);
             end
+            % Access the nodeproto inputs.
             paramInputIdx = matches(nodeProtos(nodeProtoIdx).input, [inputLayerName, '_', this.CheckEntity(1)]);
             qTensorNameMap(nodeProtos(nodeProtoIdx).input{paramInputIdx}) = struct('dqnode', dQLinearNodeProto.output{1});
         end

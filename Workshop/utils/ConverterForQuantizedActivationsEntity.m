@@ -5,37 +5,36 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
 
     properties
         ExponentValue (1,1) {mustBeNumeric}
-        IsFullyConnectedLayer
+        IsFullyConnectedLayer {mustBeNumericOrLogical}
     end
 
     methods
         function this = ConverterForQuantizedActivationsEntity(layerAnalyzer, exponentValue, opsetVersion)
             this@nnet.internal.cnn.onnx.NNTLayerConverter(layerAnalyzer);
-            this.IsRecurrentNetwork    = layerAnalyzer.IsRNNLayer;
+            this.IsRecurrentNetwork    = layerAnalyzer.IsRNNLayer; % may require in future
             this.IsFullyConnectedLayer = layerAnalyzer.IsFullyConnectedLayer;
             this.ExponentValue         = exponentValue;
-            this.OpsetVersion          = opsetVersion;
+            this.OpsetVersion          = opsetVersion;  % may require in future if default opset is updated above 18
         end
 
         function [nodeProtos, parameterInitializers, qTensorNameMap] = toOnnx(this, nodeProtos,...
                 parameterInitializers, TensorNameMap, qTensorNameMap)
             import nnet.internal.cnn.onnx.*
             inputLayerName = mapTensorNames(this, cellstr(this.NNTLayer.Name), TensorNameMap);
-
-            % If fully-connected (FC) or recurrent neural network (RNN) layer 
+            % If fully-connected (FC) or recurrent neural network (RNN) layer
             % is present in the DL network, a flatten layer is added in MATLAB.
-            % In ConverterForFlattenLayer class, the toOnnx method of that class adds the 
-            % transpose node followed by the reshape node. As this happen in 
-            % runtime while exporting the network to ONNX, the exponent data 
-            % information is not available for flatten layer in MATLAB. To 
-            % mitigate this issue,the method "addQDQNodesForFlattenAndTansposeLayer" 
-            % adds the quantize linear and dequantize linear (QDQ) nodes after 
-            % transpose and reshape node by taking previous activation 
-            % entity's exponent value. 
+            % In ConverterForFlattenLayer class, the toOnnx method of that class adds the
+            % transpose node followed by the reshape node. As this happen in
+            % runtime while exporting the network to ONNX, the exponent data
+            % information is not available for flatten layer in MATLAB. To
+            % mitigate this issue,the method "addQDQNodesForFlattenAndTansposeLayer"
+            % adds the quantize linear and dequantize linear (QDQ) nodes after
+            % transpose and reshape node by taking previous activation
+            % entity's exponent value.
 
-            % Note: As RNN layers are not yet supported for quantization as 
+            % Note: As RNN layers are not yet supported for quantization as
             % of R2024b, the conditional check only validates if the layer
-            % is FC. RNN layer condition will be added in Future. 
+            % is FC. RNN layer condition will be added in Future.
             % Use this.IsRecurrentNetwork property in future in the
             % following condition.
             if this.IsFullyConnectedLayer % || this.IsRecurrentNetwork
@@ -43,43 +42,70 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
                 if ~isQDQForReshapeTranspose
                     [qDqNodesForFcLayer, tensorProtosForFcLayer, qTensorNameMap] = addQDQNodesForFlattenAndTansposeLayer(this, nodeProtos,...
                         parameterInitializers, TensorNameMap, qTensorNameMap);
-                    nodeProtos            = [nodeProtos, qDqNodesForFcLayer];
-                    parameterInitializers = [parameterInitializers, tensorProtosForFcLayer];
+                    allNodeProtosNames     = {nodeProtos.name};
+                    transposeFCLayerName   = ['flatten_', strrep(inputLayerName{1}, '_Add', '_Transpose')];
+                    % transposeNodeProtoIdx is the nodeproto index for
+                    % transpose node; transposeNodeProtoIdx + 1 is the
+                    % nodeproto index for reshape node. This is because
+                    % transpose and reshape node are added sequentially.
+                    % These QDQ nodes after Transpose and reshape node are
+                    % added in topological order.
+                    transposeNodeProtoIdx  = find(strcmpi(transposeFCLayerName, allNodeProtosNames));
+                    % append nodeprotos.
+                    nodeProtos             = [nodeProtos(1:transposeNodeProtoIdx), qDqNodesForFcLayer(1:2),...
+                        nodeProtos(transposeNodeProtoIdx + 1), qDqNodesForFcLayer(3:4),...
+                        nodeProtos(transposeNodeProtoIdx+2:end)];
+                    % append tensorprotos.
+                    parameterInitializers  = [parameterInitializers, tensorProtosForFcLayer];
                 end
             elseif isa(this.NNTLayer, 'nnet.cnn.layer.Convolution1DLayer') ||...
-                        isa(this.NNTLayer, 'nnet.cnn.layer.Convolution2DLayer') ||...
-                        isa(this.NNTLayer, 'nnet.cnn.layer.Convolution3DLayer')
+                    isa(this.NNTLayer, 'nnet.cnn.layer.Convolution2DLayer') ||...
+                    isa(this.NNTLayer, 'nnet.cnn.layer.Convolution3DLayer')
                 if (isequal(this.NNTLayer.PaddingMode, 'same') && this.OpsetVersion > 10) ||...
                         (this.NNTLayer.PaddingValue~=0)
                     [qDqNodesForPadLayer, tensorProtosForPadLayer, qTensorNameMap] = addQDQNodesForPadLayer(this, nodeProtos,...
                         parameterInitializers, TensorNameMap, qTensorNameMap);
-                    nodeProtos            = [nodeProtos, qDqNodesForPadLayer];
+                    allNodeProtosNames  = {nodeProtos.name};
+                    padNodeName         = [inputLayerName{1}, '_Pad'];
+                    padNodeProtoIdx     = find(strcmpi(padNodeName, allNodeProtosNames));
+                    nodeProtos          = [nodeProtos(1:padNodeProtoIdx), qDqNodesForPadLayer,...
+                        nodeProtos(padNodeProtoIdx+1:end)];
                     parameterInitializers = [parameterInitializers, tensorProtosForPadLayer];
                 end
             end
-            % obtain all nodeprotos names to avoid creating duplicate names 
+            % obtain all nodeprotos names to avoid creating duplicate names
             % in quantize linear and dequantize linear nodes.
             allNodeProtosNames    = {nodeProtos.name};
-            % Create 
-            [qDqnodeProto, paramInitializer, qTensorNameMap] = createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName{1}, qTensorNameMap);
-            nodeProtos            = [nodeProtos, qDqnodeProto];
+            % Create QDQ wrapper nodes for activations entity.
+            [qDqnodeProto, paramInitializer, qTensorNameMap] = createQDQOnnxWrapperNodes(this, ...
+                allNodeProtosNames, inputLayerName{1}, qTensorNameMap);
+            layerNodeProtoIdx     = find(strcmpi(inputLayerName{1}, allNodeProtosNames));
+            if isempty(layerNodeProtoIdx)
+                nodeProtos        = [qDqnodeProto, nodeProtos];
+            else
+                nodeProtos        = [nodeProtos(1:layerNodeProtoIdx), qDqnodeProto,...
+                    nodeProtos(layerNodeProtoIdx+1:end)];
+            end
             parameterInitializers = [parameterInitializers, paramInitializer];
         end
     end
 
     methods(Access=protected)
-        function [qDqnodeProto, parameterInitializer, qTensorNameMap] = createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName, qTensorNameMap)
+        function [qDqnodeProto, parameterInitializer, qTensorNameMap] = createQDQOnnxWrapperNodes(this,...
+                allNodeProtosNames, inputLayerName, qTensorNameMap)
             nextOperatorInput   = inputLayerName;
 
             % Make the nodeProto for Scale and Zero-point for
             % QuantizeLinear node
             opType = 'QuantizeLinear';
-            [quantizeLinearNode, qTensor, nextOperatorInput] = createNodeForQuantization(this, inputLayerName, nextOperatorInput, opType, allNodeProtosNames);
+            [quantizeLinearNode, qTensor, nextOperatorInput] = createNodeForQuantization(this,...
+                inputLayerName, nextOperatorInput, opType, allNodeProtosNames);
 
             % Make the nodeProto for Scale and Zero-point for
             % DequantizeLinear Node
             opType = 'DequantizeLinear';
-            [dequantizeLinearNode, dQTensor, ~] = createNodeForQuantization(this, inputLayerName, nextOperatorInput, opType, allNodeProtosNames);
+            [dequantizeLinearNode, dQTensor, ~] = createNodeForQuantization(this,...
+                inputLayerName, nextOperatorInput, opType, allNodeProtosNames);
 
             % Update maps
             qTensorNameMap(inputLayerName) = struct('dqnode', dequantizeLinearNode.output{1, 1});
@@ -94,7 +120,8 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             qDqnodeProto          = [quantizeLinearNode, dequantizeLinearNode];
         end
 
-        function [reqNode, tensor, nextOperatorInput] = createNodeForQuantization(this, inputLayerName, nextOperatorInput, opType, allNodeProtosNames)
+        function [reqNode, tensor, nextOperatorInput] = createNodeForQuantization(this,...
+                inputLayerName, nextOperatorInput, opType, allNodeProtosNames)
             import nnet.internal.cnn.onnx.*
             [onnxName, ~] = legalizeNNTName(this, [inputLayerName, '_', opType]);
             if ismember(onnxName, allNodeProtosNames)
@@ -138,10 +165,9 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
         end
 
         function [qDqNodesForPadLayer, tensorProtosForPadLayer, qTensorNameMap] = addQDQNodesForPadLayer(this, nodeProtos,...
-                        parameterInitializers, TensorNameMap, qTensorNameMap)
+                parameterInitializers, TensorNameMap, qTensorNameMap)
             % find the last (QDQ) tensorproto of the input of the current
-            % layer. If the QDQ nodes are not present for the input layer,
-            % find it using nodeprotos.
+            % layer.
             inputTensorName = mapTensorNames(this, this.InputLayerNames, TensorNameMap);
             tensorprotoLoc  = strcmpi([inputTensorName{1}, '_QuantizeLinear', ' tensorproto'], {parameterInitializers.doc_string});
             % if the QDQ nodes are not present for the input layer of the
@@ -156,7 +182,7 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
                 % obtain the tensorproto of the scale value
                 tensorprotoLoc = matches({parameterInitializers.name}, scaleValueName);
             end
-            
+
             qDqTensorProto    = parameterInitializers(tensorprotoLoc);
             convNodeprotoName = TensorNameMap(this.NNTLayer.Name);
 
@@ -164,7 +190,8 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             allNodeProtosNames = {nodeProtos.name};
             inputLayerName     = [convNodeprotoName, '_Pad'];
             % add QDQ nodes after Transpose node
-            [qDqNodesForPadLayer, tensorProtosForPadLayer, qTensorNameMap] = createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName, qTensorNameMap);
+            [qDqNodesForPadLayer, tensorProtosForPadLayer, qTensorNameMap] =...
+                createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName, qTensorNameMap);
             % scale value of quantize linear node of the previous activation
             % node.
             tensorProtosForPadLayer(1).raw_data = qDqTensorProto.raw_data;
@@ -173,7 +200,8 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             tensorProtosForPadLayer(3).raw_data = qDqTensorProto.raw_data;
         end
 
-        function [qDqNodesForFcLayer, tensorProtosForFcLayer, qTensorNameMap] = addQDQNodesForFlattenAndTansposeLayer(this, nodeProtos,...
+        function [qDqNodesForFcLayer, tensorProtosForFcLayer, qTensorNameMap] =...
+                addQDQNodesForFlattenAndTansposeLayer(this, nodeProtos,...
                 parameterInitializers, TensorNameMap, qTensorNameMap)
             % find the previous node QDQ nodeproto
             for node = length(nodeProtos):-1:1
@@ -184,7 +212,7 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             end
             % obtain the tensorproto of the scale value
             tensorprotoLoc = matches({parameterInitializers.name}, scaleValueName);
-            
+
             qDqTensorProto = parameterInitializers(tensorprotoLoc);
 
             % obtain input layer name (transpose node for FC layer)
@@ -192,7 +220,9 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             inputLayerName     = [this.InputLayerNames{1, 1}, '_Transpose'];
             inputLayerName     = legalizeNNTName(this, inputLayerName);
             % add QDQ nodes after Transpose node
-            [qDqnodeProtoTransposeNode, paramInitTransposeNode, qTensorNameMap] = createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName, qTensorNameMap);
+            [qDqnodeProtoTransposeNode, paramInitTransposeNode, qTensorNameMap] =...
+                createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName,...
+                qTensorNameMap);
             % scale value of quantize linear node of the previous activation
             % node.
             paramInitTransposeNode(1).raw_data = qDqTensorProto.raw_data;
@@ -203,7 +233,9 @@ classdef ConverterForQuantizedActivationsEntity < nnet.internal.cnn.onnx.NNTLaye
             % obtain input layer name (reshape node for FC layer) from TensorNameMap
             inputLayerName     = TensorNameMap(this.InputLayerNames{1, 1});
             % add QDQ nodes after reshape node
-            [qDqnodeProtoReshapeNode, paramInitReshapeNode, qTensorNameMap] = createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName, qTensorNameMap);
+            [qDqnodeProtoReshapeNode, paramInitReshapeNode, qTensorNameMap] =...
+                createQDQOnnxWrapperNodes(this, allNodeProtosNames, inputLayerName,...
+                qTensorNameMap);
             % scale value of quantize linear node of the previous activation
             % node.
             paramInitReshapeNode(1).raw_data = qDqTensorProto.raw_data;

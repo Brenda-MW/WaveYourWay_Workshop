@@ -184,6 +184,7 @@ classdef ConverterForQuantizedNetwork
         function [nodeProtos, parameterInitializers, networkOutputs] = addQuantizationInfo(this, nodeProtos,...
                 parameterInitializers, networkOutputs, TensorNameMap, networkAnalysis, qdqTable, qDetails, qInfoComposite)
             import nnet.internal.cnn.onnx.*
+            allExistingNodeProtoNames = {nodeProtos.name};
             % fuse batchnorm layer with conv layers.
             qTensorNameMap         = containers.Map;
             for layer = 1:length(this.Network.Layers)
@@ -210,7 +211,7 @@ classdef ConverterForQuantizedNetwork
             % nodes. This is obtained to change the inputs of the existing
             % nodeprotos to updated QDQ nodes and dequantizelinear
             % weights/bias nodes.
-            numExistingNodeProtos  = length(nodeProtos);
+            % numExistingNodeProtos  = length(nodeProtos);
             for qLayer = 1:length(qdqTable)
                 checkEntity      = qdqTable(qLayer).EntityType;
                 scaleValue       = qdqTable(qLayer).Exponent;
@@ -243,7 +244,7 @@ classdef ConverterForQuantizedNetwork
 
             % This changes the input-output connections of the existing
             % nodeprotos (i.e. the nodeprotos without the QDQ nodes).
-            nodeProtos = updateInputOutputConnections(this, nodeProtos, numExistingNodeProtos, qTensorNameMap);
+            nodeProtos = updateInputOutputConnections(this, nodeProtos, allExistingNodeProtoNames, qTensorNameMap);
 
             % Update network for dangling layers.
             % If the layer is dangling, obtain its QDQ nodes output and
@@ -256,19 +257,20 @@ classdef ConverterForQuantizedNetwork
             end
         end
 
-        function nodeProtos = updateInputOutputConnections(~, nodeProtos, numExistingNodeProtos, qTensorNameMap)
-            for numNodeProto = 1:numExistingNodeProtos
-                for numInput = 1:numel(nodeProtos(numNodeProto).input)
-                    while (isKey(qTensorNameMap, nodeProtos(numNodeProto).input{numInput}) && isstruct(qTensorNameMap(nodeProtos(numNodeProto).input{numInput})))
-                        valueNames = qTensorNameMap(nodeProtos(numNodeProto).input{numInput});
-                        nodeProtos(numNodeProto).input{numInput} = valueNames.dqnode;
+        function nodeProtos = updateInputOutputConnections(~, nodeProtos, allExistingNodeProtoNames, qTensorNameMap)
+            for numNodeProto = 1:length(nodeProtos)
+                if any(strcmpi(nodeProtos(numNodeProto).name, allExistingNodeProtoNames))
+                    for numInput = 1:numel(nodeProtos(numNodeProto).input)
+                        while (isKey(qTensorNameMap, nodeProtos(numNodeProto).input{numInput}) && isstruct(qTensorNameMap(nodeProtos(numNodeProto).input{numInput})))
+                            valueNames = qTensorNameMap(nodeProtos(numNodeProto).input{numInput});
+                            nodeProtos(numNodeProto).input{numInput} = valueNames.dqnode;
+                        end
                     end
                 end
             end
         end
     end
 end
-
 function tf = MathWorksOperatorsUsed(modelProto)
 nodes = modelProto.graph.node;
 tf = any(arrayfun(@(n)isequal(lower(n.domain), 'com.mathworks'), nodes));
